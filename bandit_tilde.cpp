@@ -27,9 +27,12 @@ typedef struct Instrument {
     bool active { false };
     size_t tail {0};
     measure *m_first { NULL };
+    measure *cache { NULL };
+    long prev { 0 };
+    bool enabled { false };
 } instrument;
 
-
+#define THRESHOLD 2
 
 class bandit : public object<bandit>, public vector_operator<> {
 public:
@@ -39,17 +42,33 @@ public:
 	MIN_AUTHOR		{ "J. Kusel" };
 	MIN_RELATED		{ "" };
     
-    inlet<>                                                 sig             { this, "(signal)", "signal" };
-	inlet<>													input			{ this, "(open) bandit" };
-    outlet<>                                                outsig          { this, "(signal)", "signal" };
-	outlet<thread_check::scheduler, thread_action::fifo>	output_true		{ this, "(bang) input is non-zero" };
-	outlet<thread_check::scheduler, thread_action::fifo>	output_false	{ this, "(bang) input is zero" };
+    bandit(const atoms& args = {}) {
+        short arg_num = args.size();
+        // put argument checking here!
+        if (arg_num) {
+            m_channels = args[0];
+            for (auto i=0; i<m_channels; ++i)
+                m_outlets.push_back(std::make_unique<outlet<>>(this, std::string("(signal) audio output ") + std::to_string(i), "signal"));
+        }
+        if (arg_num == 2) {
+            filepath = std::string(args[1]);
+            parser.set();
+        }
+        info_out = std::make_unique<outlet<thread_check::scheduler, thread_action::fifo>>(this, "(list) timing information", "list");
+    }
+    
+    //inlet<>                                                 sig             { this, "(signal)", "signal" };
+	//inlet<>													input			{ this, "(open) bandit" };
+    //outlet<>                                                info_out          { this, "(list) timing information", "bang" };
+	//outlet<>	info_out		{ this, "(bang) input is non-zero" };
+	//outlet<thread_check::scheduler, thread_action::fifo>	output_false	{ this, "(bang) input is zero" };
     
     // deferred file loading
-    queue<> deferrer { this,
+    queue<> parser { this,
         MIN_FUNCTION {
             std::ifstream in { this->filepath };
             short line_count { -2 };
+            //short inst_count { 0 };
             for (std::string line; std::getline(in, line); )
             {
                 size_t pos { 0 };
@@ -135,42 +154,146 @@ public:
         MIN_FUNCTION {
             string arguments = to_string(args);
             if (args.size() == 1) {
-                arguments.copy(this->filepath, arguments.size(), 0);
-            
-                cout << args.size() << endl;
-                cout << arguments << endl;
-                deferrer.set();
+                this->filepath = std::string(args[0]);
+                parser.set();
             } else {
                 cerr << "'open' command requires an absolute filepath argument." << endl;
             }
             return {};
         }
     };
+    
+    message<> reset { this, "reset", "Reset the transport",
+        MIN_FUNCTION {
+            this->trail = 0;
+            return {};
+        }
+    };
+                
+    message<> play { this, "play", "Start playback.",
+        MIN_FUNCTION {
+            this->playing = true;
+            this->trail = 0;
+            for (auto i=0; i<8; ++i) {
+                if (instruments[i].active)
+                    instruments[i].enabled = true;
+            }
+            return {};
+        }
+    };
+                
+                message<> stop { this, "stop", "Stop playback.",
+                    MIN_FUNCTION {
+                        this->playing = false;
+                        return {};
+                    }
+                };
+                
+                
+    long mstos(double ms) {
+        return ms * samplerate() / 1000.0;
+    }
+    double stoms(long s) {
+        return s / samplerate() * 1000.0;
+    }
+    void negative_clear(audio_bundle output, short index) {
+        auto out = output.samples(index);
+        for (auto s=0; s<output.frame_count(); ++s)
+            out[s] = 0.0;
+    }
 
     void operator()(audio_bundle input, audio_bundle output) {
-        if (this->is_loaded) {
-            //output = input;
-            //std::vector<sample> chunk = std::vector<sample>(output.size(), (sample) 0.0);
-            measure* meas = instruments[0].m_first;
-            auto out = output.samples(0);
-            auto in = input.samples(0);
-            double dub_frame = (double) input.frame_count();
-            if (meas->bank.empty()) {
-                for (auto s=0; s<dub_frame; ++s) {
-                    out[s] = 5.0;//(sample) meas->bank.operator[](0);//meas->bank->operator[](100);//meas->bank->tail((size_t) (s+instruments[0].tail));
+        double dub_frame = (double) output.frame_count();
+        if (!this->playing) {
+            output.clear();
+        } else if (this->is_loaded) {
+            for (auto channel=0; channel<output.channel_count(); ++channel) {
+                instrument* inst = &instruments[channel];
+                if (!inst->enabled) {
+                    negative_clear(output, channel);
+                } else {
+                    auto out = output.samples(channel);
+                    if (inst->cache == NULL) {
+                        measure* meas = inst->m_first;
+                        inst->prev = 0;
+                        while ((meas != NULL) && (mstos(meas->offset) < trail)) {
+                            inst->prev = trail;
+                            meas = meas->next;
+                        }
+                        if (meas == NULL) {
+                            inst->prev = trail;
+                            meas = inst->m_first;
+                        }
+                        inst->cache = meas;
+                        info_out->send(channel, 1);
+                    }
+                    // send information about next measure
+                    //info_out->send(channel, inst->cache->timesig);
+                    long offset = mstos(inst->cache->offset);
+                    // frame_start keeps track of the absolute track position relative
+                    // to the active measure.
+                    int frame_start = trail - offset;
+                    
+                    // these next two handle measure tacets
+                    long wait_frame_base = offset - inst->prev;
+                    long wait_frame = trail - inst->prev;
+                    if (frame_start + dub_frame < 0) {
+                        for (auto s=0; s<dub_frame; ++s) {
+                            // waiting...
+                            out[s] = ((double) (wait_frame + s))/wait_frame_base;
+                        }
+                    } else {
+                        for (auto s=0; s<dub_frame; ++s) {
+                            int target_frame = frame_start + s;
+                            // waiting...
+                            if (target_frame < 0) {
+                                out[s] = ((double) (wait_frame + s))/wait_frame_base;
+                            } else if (target_frame >= inst->cache->bank.size()) {
+                                if (inst->cache->next == NULL) {
+                                    inst->cache = NULL;
+                                    inst->enabled = false;
+                                    break;
+                                }
+                                inst->prev = trail + s;
+                                inst->cache = inst->cache->next;
+                                wait_frame_base = offset - inst->prev;
+                                wait_frame = trail - inst->prev;
+                                offset = mstos(inst->cache->offset);
+                                
+                                long gap = offset - trail - s;
+                                cout << inst->cache->offset << endl;
+                                cout << trail << endl;
+                                cout << trail + s << endl;
+                                info_out->send(channel, "gap", (int) gap);
+                                if (gap >= 0) {
+                                    // send break information
+                                    info_out->send(channel, 1, "tacet");
+                                } else {
+                                    // send information about next measure
+                                    info_out->send(channel, inst->cache->timesig, "next");
+                                }
+                                
+                                
+                                frame_start = trail - offset;// + s;
+                            } else {
+                                if (target_frame == 0)
+                                    info_out->send(channel, inst->cache->timesig, "first");
+                                out[s] = inst->cache->bank[target_frame];
+                            }
+                        }
+                    }
                 }
-            } else {
-            for (auto s=0; s<dub_frame; ++s) {
+            }
+            trail += dub_frame;
+            /*for (auto s=0; s<dub_frame; ++s) {
                 if (trail + s > meas->bank.size())
                     trail = 0;
-                out[s] = in[s] + meas->bank[(trail + s) % meas->bank.size()];//(sample) meas->bank.operator[](0);//meas->bank->operator[](100);//meas->bank->tail((size_t) (s+instruments[0].tail));
+                out[s] = in[s] + meas->bank[(trail + s) % meas->bank.size()];
             }
-            }
-            trail += input.frame_count();
+            
             if (trail >= meas->bank.size())
                 trail = trail % meas->bank.size();
-            //instruments[0].tail = (instruments[0].tail + output.frame_count()) % meas->bank->size();
-
+*/
         } else {
             output.clear();
         }
@@ -191,14 +314,11 @@ public:
         std::vector<int> lengths;
         double increment { (meas->end - meas->start)/subdiv };
         double height { 1.0/subdiv };
-        //cout << subdiv << " " << increment << endl;
         int s;
-        //int total { 0 };
-        // assumes 44.1kHz sample rate
-        
+        double sr = samplerate() * 60.0;
         for (s=0; s<subdiv; s++) {
             double bpm { meas->start + increment * s };
-            int segment = 2646000.0/(PPQ_tempo*bpm);
+            int segment = sr/(PPQ_tempo*bpm);
             double inc { height/segment };
             for (int samp=0; samp<segment; samp++) {
                 meas->bank.push_back((sample) (inc*samp + height*s));
@@ -207,16 +327,22 @@ public:
     }
 
 private:
+                unique_ptr<inlet<>>             input;
+    vector< unique_ptr<outlet<>> >   m_outlets;
+    unique_ptr<outlet<thread_check::scheduler, thread_action::fifo>>    info_out;
+                std::string filepath { "" };
+                int m_channels { 1 };
 	//sample            prev    { 0.0 };
     int               PPQ     { 0 };
     int               PPQ_tempo { 0 };
-            bool              is_loaded { false };
-            int trail {0};
+    bool              is_loaded { false };
+                    bool playing { false };
+    long trail {0};
     instrument instruments[8];
     
     //c74::max::t_symbol  fs      { "" };
     //c74::max::t_handle f_fh {};
-    char               filepath[MAX_PATH_CHARS];
+    //char               filepath[MAX_PATH_CHARS];
     //bool        f_open { false };
 };
     
